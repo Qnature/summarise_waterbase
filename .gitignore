@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+/inputs
+/outputs
+/.quarto/
+/summarise_water_quality_from_waterbase_files
+summarise_water_quality_from_waterbase.html

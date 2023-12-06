@@ -1,0 +1,547 @@
+---
+title: "SBTN"
+subtitle: "Baseline Water Quality Data for Europe"
+author: "Rafael Camargo"
+date: "Nov 17, 2023"
+engine: knitr
+format:
+  html:
+    toc: true
+warning: false
+code-fold: true
+---
+
+This notebook creates a baseline water quality data for Europe as summarizing observations of total nitrogen (N) and total Phosphorous (P) concentrations, based on data from the European Environmental Agency's [Waterbase - Water Quality ICM, 2022](https://www.eea.europa.eu/en/datahub/datahubitem-view/fbf3717c-cd7b-4785-933a-d0cf510542e1). Firstly, it performs a temporal aggregation as obtaining the 75th percentile of annual means of nutrient concentrations, based on 1,047,387 data points (collected between 2000 and 2021) from 14,931 monitoring stations, using data from the Waterbase. Secondly, it performs a spatial aggregation as obtaining the average nutrient concentrations of monitoring stations within each river basin where they are located, using in this case [HydroBasins level 6](https://www.hydrosheds.org/products/hydrobasins) delineations. 
+
+## 1. Setup
+
+Load required packages
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, here, readxl, janitor, sf, units, skimr, mapview, leafpop, scales, plotly, openxlsx)
+```
+
+```{r}
+sf::sf_use_s2(FALSE) # due to issues in geometries
+```
+
+## 2. Load data
+
+```{r}
+agg_data <- read_csv(here("inputs", "waterbase", "Waterbase_v2022_1_T_WISE6_AggregatedData.csv")) |> 
+  filter(observedPropertyDeterminandLabel %in% c("Total nitrogen", "Total phosphorus"))
+```
+
+```{r}
+monitoring_sites_2022 <- read_csv(here("inputs", "waterbase", "Waterbase_v2022_1_S_WISE6_SpatialObject_DerivedData.csv"))
+```
+
+```{r}
+monitoring_sites_2019 <- read_sf(here("inputs", "wise_wfd_2019", "MonitoringSite", "MonitoringSite.shp"))
+```
+
+```{r}
+rbd <- read_sf(here("inputs", "wise_wfd_2019", "RiverBasinDistrict", "RiverBasinDistrict.shp"))
+```
+
+```{r}
+onedrive_data <- "/Users/camargorafael/Library/CloudStorage/OneDrive-SharedLibraries-TheBostonConsultingGroup,Inc/Q-NC-Communities - G3S/3. Data"
+```
+
+```{r}
+h6 <- son_water <- read_rds(here(onedrive_data, "sbtn", "sbtn_son_water.rds")) |> 
+  select(HYBAS_ID, WMOBB_name)
+```
+
+## 3. Clean data
+
+```{r}
+monitoring_sites_2022_clean <- monitoring_sites_2022 |>
+  filter(!if_any(lat:lon, ~ is.na(.x))) |> 
+  filter(!is.na(monitoringSiteIdentifier)) |>
+  group_by(monitoringSiteIdentifier) |> 
+  arrange(monitoringSiteName) |> 
+  filter(row_number() == 1) |> 
+  ungroup() |> 
+  st_as_sf(coords = c("lon", "lat"), crs = "EPSG:4326", remove = F)
+```
+
+```{r}
+rbd_clean <- rbd |> 
+  mutate(nameTxtInt = if_else(is.na(nameTxtInt), nameText, nameTxtInt)) |> 
+  select(
+    rbdIdentifier = thematicId,
+    rbdIdentifierScheme = themaIdSch,
+    rbdName = nameTxtInt
+  )
+```
+
+```{r}
+monitoring_sites_2019_clean <- monitoring_sites_2019 |>
+  filter(!st_is_empty(monitoring_sites_2019) == T) |> 
+  mutate(nameTxtInt = if_else(is.na(nameTxtInt), nameText, nameTxtInt)) |> 
+  select(
+    countryCode = country,
+    thematicIdIdentifier = thematicId,
+    thematicIdIdentifierScheme = themaIdSch,
+    monitoringSiteName = nameTxtInt,
+    waterBodyIdentifier = foiId,
+    waterBodyIdentifierScheme = foiIdSch,
+    lat, lon
+  ) |> 
+  st_join(rbd_clean) |> 
+  group_by(thematicIdIdentifier) |> 
+  arrange(monitoringSiteName) |> 
+  filter(row_number() == 1) |> 
+  ungroup() |> 
+  relocate(countryCode:waterBodyIdentifierScheme, rbdIdentifier:rbdName, lat, lon, geometry)
+```
+
+### 3.1. Join data
+
+```{r}
+join1 <- agg_data |> 
+  left_join(st_drop_geometry(monitoring_sites_2022_clean), by = "monitoringSiteIdentifier", suffix = c("", ".ms22"))
+```
+
+```{r}
+join2 <- join1 |>
+  filter(if_any(lat:lon, ~ is.na(.x))) |> 
+  left_join(st_drop_geometry(monitoring_sites_2019_clean), by = c("monitoringSiteIdentifier" = "thematicIdIdentifier"), suffix = c("", ".ms19")) |> 
+  filter(!if_any(lat.ms19:lon.ms19, ~ is.na(.x)))
+```
+
+```{r}
+data <- join1 |>
+  filter(!if_any(lat:lon, ~ is.na(.x))) |>
+  bind_rows(join2) |> 
+  mutate(
+    thematicIdIdentifierScheme = if_else(is.na(thematicIdIdentifierScheme), thematicIdIdentifierScheme.ms19, thematicIdIdentifierScheme),
+    monitoringSiteName = if_else(is.na(monitoringSiteName), monitoringSiteName.ms19, monitoringSiteName),
+    waterBodyIdentifier = if_else(is.na(waterBodyIdentifier), waterBodyIdentifier.ms19, waterBodyIdentifier),
+    waterBodyIdentifierScheme = if_else(is.na(waterBodyIdentifierScheme), waterBodyIdentifierScheme.ms19, waterBodyIdentifierScheme),
+    rbdIdentifier = if_else(is.na(rbdIdentifier), rbdIdentifier.ms19, rbdIdentifier),
+    rbdIdentifierScheme = if_else(is.na(rbdIdentifierScheme), rbdIdentifierScheme.ms19, rbdIdentifierScheme),
+    rbdName = if_else(is.na(rbdName), rbdName.ms19, rbdName),
+    lat = if_else(is.na(lat), lat.ms19, lat),
+    lon = if_else(is.na(lon), lon.ms19, lon)
+  ) |> 
+  select(-c(countryCode.ms22, monitoringSiteIdentifierScheme.ms22, countryCode.ms19:rbdName.ms19, lat.ms19, lon.ms19)) |> 
+  # selects the row of highest mean value, from the multiple 'parameterSampleDepth'
+  group_by(monitoringSiteIdentifier, observedPropertyDeterminandLabel, phenomenonTimeReferenceYear) |> 
+  arrange(desc(resultMeanValue)) |> 
+  filter(row_number() == 1) |> 
+  ungroup()
+```
+
+## 4. Temporal aggregation
+
+### 4.1. 75th percentile of the annual mean since year 2000
+```{r}
+summary1 <- data |>
+  filter(phenomenonTimeReferenceYear >= 2000) |>
+  filter(!is.na(resultMeanValue)) |>
+  arrange(phenomenonTimeReferenceYear) |>
+  mutate(quality_element = case_when(
+    observedPropertyDeterminandLabel == "Total nitrogen" ~ "n",
+    observedPropertyDeterminandLabel == "Total phosphorus" ~ "p"
+  )) |> 
+  group_by(monitoringSiteIdentifier, quality_element) |>
+  summarise(
+    num_years = n(),
+    first_year = first(phenomenonTimeReferenceYear),
+    last_year = last(phenomenonTimeReferenceYear),
+    sum_samples = sum(resultNumberOfSamples, na.rm = T),
+    min_25p = quantile(resultMinimumValue, 0.25, na.rm = T),
+    mean_75p = quantile(resultMeanValue, 0.75, na.rm = T),
+    max_75p = quantile(resultMaximumValue, 0.75, na.rm = T),
+  ) |> 
+  ungroup() |>
+  arrange(quality_element) |> 
+  pivot_wider(
+    names_from = quality_element,
+    values_from = c(num_years:max_75p),
+    names_glue = "{quality_element}_{.value}",
+    names_vary = "slowest"
+  ) |> 
+  mutate(enough_data = "Yes")
+```
+
+### 4.2. Annual mean
+```{r}
+summary2 <- data |> 
+  mutate(
+    monitoringSiteIdentifier = monitoringSiteIdentifier,
+    quality_element = case_when(
+      observedPropertyDeterminandLabel == "Total nitrogen" ~ "n",
+      observedPropertyDeterminandLabel == "Total phosphorus" ~ "p"
+    ),
+    year = phenomenonTimeReferenceYear,
+    mean = resultMeanValue,
+    .keep = "none"
+  ) |>
+  filter(year >= 2000) |>
+  arrange(quality_element, year) |> 
+  pivot_wider(
+    names_from = c(quality_element, year),
+    values_from = mean
+  )
+```
+
+### 4.3. Put summaries together
+```{r}
+summary <- data |> 
+  distinct(monitoringSiteIdentifier, monitoringSiteName, rbdIdentifier, rbdName, subUnitName, lat, lon) |> 
+  left_join(summary1, by = "monitoringSiteIdentifier") |>
+  left_join(summary2, by = "monitoringSiteIdentifier") |>
+  filter(enough_data == "Yes") |> 
+  mutate(
+    across(c(n_min_25p:n_max_75p, n_2000:n_2021), ~ round(.x, 1)),
+    across(c(p_min_25p:p_max_75p, p_2000:p_2021), ~ round(.x, 3))
+  ) |> 
+  select(!enough_data)
+```
+
+### 4.4. Explore data
+
+```{r}
+paste(
+  "After data cleaning, we have", 
+  data |> filter(phenomenonTimeReferenceYear >= 2000) |> filter(!is.na(resultMeanValue)) |> pull(resultNumberOfSamples) |> sum(na.rm = T),
+  "data points on total N & P concentrations, from", nrow(summary),
+  "monitoring sites across European rivers. Below are some summary interactive charts."
+)
+```
+
+```{r}
+boxplot_year <- summary |> 
+  pivot_longer(
+    cols = c(n_first_year, n_last_year, p_first_year, p_last_year),
+    names_to = c("Parameter", "first_last"),
+    names_pattern = "(.)_(.*)",
+    values_to = "year"
+  ) |>
+  mutate(
+    Parameter = case_when(Parameter == "n" ~ "N", Parameter == "p" ~ "P"),
+    first_last = case_when(first_last == "first_year" ~ "First year", first_last == "last_year" ~ "Last year")
+  ) |> 
+  ggplot(aes(x = first_last, y = year, fill = Parameter)) +
+  geom_boxplot() +
+  theme_classic() +
+  labs(title = "Distribution of data in terms of first and last year of observations", x = "", y = "")
+
+ggplotly(boxplot_year) |>
+  layout(boxmode = "group")
+```
+
+```{r}
+boxplot_samples <- summary |> 
+  pivot_longer(
+    cols = c(n_sum_samples, p_sum_samples),
+    names_to = "Parameter",
+    values_to = "num_samples"
+  ) |>
+  mutate(Parameter = case_when(Parameter == "n_sum_samples" ~ "N", Parameter == "p_sum_samples" ~ "P")) |> 
+  ggplot(aes(x = Parameter, y = num_samples, fill = Parameter)) +
+  geom_boxplot() +
+  theme_classic() +
+  labs(title = "Distribution of data in terms number of samples to compute the stats", x = "", y = "")
+
+ggplotly(boxplot_samples)
+```
+
+```{r}
+boxplot_n <- summary |> 
+  ggplot(aes(x = , y = n_mean_75p)) +
+  geom_boxplot(fill = "grey") +
+  theme_classic() +
+  labs(title = "75th percentile of the annual mean total N concentration since year 2000", y = "Total N concentration (mg{N}/L)")
+
+ggplotly(boxplot_n)
+```
+
+```{r}
+boxplot_p <- summary |> 
+  ggplot(aes(x = , y = p_mean_75p)) +
+  geom_boxplot(fill = "grey") +
+  theme_classic() +
+  labs(title = "75th percentile of the annual mean total P concentration since year 2000", y = "Total P concentration (mg{P}/L)")
+
+ggplotly(boxplot_p)
+```
+
+## 5. Spatial aggregation
+
+### 5.1. Prepare monitoring sites data
+```{r}
+summary_pts <- summary |> 
+  st_as_sf(coords = c("lon", "lat"), crs = "EPSG:4326", remove = F)
+```
+
+```{r}
+summary_pts_n <- summary_pts |> 
+  select(monitoringSiteIdentifier:lon, n_num_years:n_max_75p, n_2000:n_2021) |> 
+  filter(!if_all(n_num_years:n_2021, ~ is.na(.x)))
+```
+
+```{r}
+summary_pts_p <- summary_pts |> 
+  select(monitoringSiteIdentifier:lon, p_num_years:p_max_75p, p_2000:p_2021) |> 
+  filter(!if_all(p_num_years:p_2021, ~ is.na(.x)))
+```
+
+```{r}
+popup_list_n <- select(summary_pts_n, c(monitoringSiteIdentifier:subUnitName, starts_with("n_"))) |> names()
+
+mapview(
+  summary_pts_n,
+  layer.name = "Total N concentration (mg/l) at monitoring site",
+  zcol = "n_mean_75p",
+  at = c(seq(from = 0, to = 0.8*4, by = 0.8/2), max(summary_pts_n$n_mean_75p, na.rm = T)),
+  cex = 3,
+  lwd = 0.2,
+  popup = popupTable(summary_pts_n, zcol = popup_list_n)
+)
+```
+
+```{r}
+popup_list_p <- select(summary_pts_p, c(monitoringSiteIdentifier:subUnitName, starts_with("p_"))) |> names()
+
+mapview(
+  summary_pts_p,
+  layer.name = "Total P concentration (mg/l) at monitoring site",
+  zcol = "p_mean_75p",
+  at = c(seq(from = 0, to = 0.046*4, by = 0.046/2), max(summary_pts_p$p_mean_75p, na.rm = T)),
+  cex = 3,
+  lwd = 0.2,
+  popup = popupTable(summary_pts_p, zcol = popup_list_p)
+)
+```
+
+### 5.2. Average within HydroBasins level 6
+
+```{r}
+summary_h6_n <- summary_pts_n |>
+  st_join(select(h6, HYBAS_ID)) |>
+  st_drop_geometry() |>
+  group_by(HYBAS_ID) |>
+  summarise(
+    n_num_stations = n(),
+    n_num_years = max(n_num_years, na.rm = T),
+    n_first_year = min(n_first_year, na.rm = T),
+    n_last_year = max(n_last_year, na.rm = T),
+    n_sum_samples = sum(n_sum_samples, na.rm = T),
+    n_mean_75p = mean(n_mean_75p, na.rm = T),
+    across(n_2000:n_2021, ~ mean(.x, na.rm = T))
+  ) |> 
+  mutate(across(c(n_mean_75p, n_2000:n_2021), ~ round(.x, 1)))
+
+summary_h6_n <- h6 |> 
+  left_join(summary_h6_n, by = "HYBAS_ID") |> 
+  relocate(geometry, .after = last_col()) |> 
+  filter(!if_all(n_num_stations:n_2021, ~ is.na(.x)))
+```
+
+```{r}
+summary_h6_p <- summary_pts_p |>
+  st_join(select(h6, HYBAS_ID)) |>
+  st_drop_geometry() |>
+  group_by(HYBAS_ID) |>
+  summarise(
+    p_num_stations = n(),
+    p_num_years = max(p_num_years, na.rm = T),
+    p_first_year = min(p_first_year, na.rm = T),
+    p_last_year = max(p_last_year, na.rm = T),
+    p_sum_samples = sum(p_sum_samples, na.rm = T),
+    p_mean_75p = mean(p_mean_75p, na.rm = T),
+    across(p_2000:p_2021, ~ mean(.x, na.rm = T))
+  ) |> 
+  mutate(across(c(p_mean_75p, p_2000:p_2021), ~ round(.x, 3)))
+
+summary_h6_p <- h6 |> 
+  left_join(summary_h6_p, by = "HYBAS_ID") |> 
+  relocate(geometry, .after = last_col()) |> 
+  filter(!if_all(p_num_stations:p_2021, ~ is.na(.x)))
+```
+
+```{r}
+summary_h6 <- h6 |> 
+  left_join(full_join(
+    st_drop_geometry(summary_h6_n) |> select(!WMOBB_name),
+    st_drop_geometry(summary_h6_p) |> select(!WMOBB_name),
+    by = "HYBAS_ID"
+  ), by = "HYBAS_ID") |> 
+  mutate(limiting_factor = case_when(
+    n_mean_75p/p_mean_75p < 7 ~ "N limiting", 
+    n_mean_75p/p_mean_75p >= 7 ~ "P limiting",
+    .default = "P limiting"
+  ), .after = WMOBB_name) |> 
+  relocate(geometry, .after = last_col()) |> 
+  filter(!if_all(n_num_stations:p_2021, ~ is.na(.x)))
+```
+
+### 5.3. Explore data
+
+```{r}
+summary_h6_simplified <- summary_h6 |> st_transform("EPSG:8857") |> st_simplify(dTolerance = 1000) |> st_transform("EPSG:4326")
+```
+
+* Nutrient limiting factor
+```{r}
+mapview(
+  summary_h6_simplified,
+  layer.name = "Nutrient limiting factor",
+  zcol = "limiting_factor",
+  col.regions = c("royalblue3", "orangered3"),
+  popup = popupTable(summary_h6_simplified, zcol = c("HYBAS_ID", "WMOBB_name", "limiting_factor", "n_num_stations", "p_num_stations", "n_num_years", "p_num_years", "n_first_year", "p_first_year", "n_last_year", "p_last_year", "n_sum_samples", "p_sum_samples", "n_mean_75p", "p_mean_75p"))
+)
+```
+
+* N-limited river basins
+```{r}
+popup_list_n_h6 <- c("HYBAS_ID", "WMOBB_name", "limiting_factor", "n_num_stations", "n_num_years", "n_first_year", "n_last_year", "n_sum_samples", "n_mean_75p")
+
+map_n <- mapview(
+  filter(summary_h6_simplified, limiting_factor == "N limiting"),
+  layer.name = "Total N concentration (mg/l)",
+  label = "WMOBB_name",
+  zcol = "n_mean_75p",
+  at = c(seq(from = 0, to = 0.8*4, by = 0.8/2), max(summary_h6$n_mean_75p, na.rm = T)),
+  lwd = 0.2,
+  alpha.regions = 0.95,
+  popup = popupTable(filter(summary_h6_simplified, limiting_factor == "N limiting"), zcol = popup_list_n_h6)
+) +
+mapview(
+  st_intersection(summary_pts_n, filter(summary_h6_simplified, limiting_factor == "N limiting")),
+  layer.name = "Total N concentration (mg/l) at monitoring site",
+  zcol = "n_mean_75p",
+  at = c(seq(from = 0, to = 0.8*4, by = 0.8/2), max(summary_pts_n$n_mean_75p, na.rm = T)),
+  cex = 3,
+  lwd = 0.2,
+  legend = F,
+  popup = popupTable(st_intersection(summary_pts_n, filter(summary_h6_simplified, limiting_factor == "N limiting")), zcol = popup_list_n)
+)
+map_n
+```
+
+* P-limited river basins
+```{r}
+popup_list_p_h6 <- c("HYBAS_ID", "WMOBB_name", "limiting_factor", "p_num_stations", "p_num_years", "p_first_year", "p_last_year", "p_sum_samples", "p_mean_75p")
+
+map_p <- mapview(
+  filter(summary_h6_simplified, limiting_factor == "P limiting"),
+  layer.name = "Total P concentration (mg/l)",
+  label = "WMOBB_name",
+  zcol = "p_mean_75p",
+  at = c(seq(from = 0, to = 0.046*4, by = 0.046/2), max(summary_h6$p_mean_75p, na.rm = T)),
+  lwd = 0.2,
+  alpha.regions = 0.95,
+  popup = popupTable(filter(summary_h6_simplified, limiting_factor == "P limiting"), zcol = popup_list_p_h6)
+) +
+mapview(
+  st_intersection(summary_pts_p, filter(summary_h6_simplified, limiting_factor == "P limiting")),
+  layer.name = "Total P concentration (mg/l) at monitoring site",
+  zcol = "p_mean_75p",
+  at = c(seq(from = 0, to = 0.046*4, by = 0.046/2), max(summary_pts_p$p_mean_75p, na.rm = T)),
+  cex = 3,
+  lwd = 0.2,
+  legend = F,
+  popup = popupTable(st_intersection(summary_pts_p, filter(summary_h6_simplified, limiting_factor == "P limiting")), zcol = popup_list_p)
+)
+map_p
+```
+
+* N-limited and P-limited basins together
+```{r}
+map_n + map_p
+```
+
+### 5.4. Robustness check
+The darker the red, the lesser robust (higher uncertainty)
+
+```{r}
+data_robustness_check <- summary_h6_simplified |> 
+  mutate(
+    num_stations = case_when(limiting_factor == "N limiting" ~ n_num_stations, limiting_factor == "P limiting" ~ p_num_stations),
+    num_years = case_when(limiting_factor == "N limiting" ~ n_num_years, limiting_factor == "P limiting" ~ p_num_years),
+    last_year = case_when(limiting_factor == "N limiting" ~ n_last_year, limiting_factor == "P limiting" ~ p_last_year),
+    sum_samples = case_when(limiting_factor == "N limiting" ~ n_sum_samples, limiting_factor == "P limiting" ~ p_sum_samples)
+  )
+```
+
+```{r}
+map_robustness_check <- mapview(
+  data_robustness_check,
+  layer.name = "Number of stations",
+  label = "WMOBB_name",
+  zcol = "num_stations",
+  at = quantile(data_robustness_check$num_stations, probs = seq(0,1,0.2), na.rm = T),
+  col.regions = scales::brewer_pal(type = "seq", palette = "Reds", direction = -1)(6),
+  lwd = 0.2,
+  alpha.regions = 0.25,
+  popup = popupTable(data_robustness_check, zcol = c("HYBAS_ID", "WMOBB_name", "limiting_factor", "num_stations", "num_years", "last_year", "sum_samples"))
+) +
+mapview(
+  data_robustness_check,
+  layer.name = "Number of years",
+  label = "WMOBB_name",
+  zcol = "num_years",
+  at = quantile(data_robustness_check$num_years, probs = seq(0,1,0.2), na.rm = T),
+  col.regions = scales::brewer_pal(type = "seq", palette = "Reds", direction = -1)(6),
+  lwd = 0.2,
+  alpha.regions = 0.25,
+  popup = popupTable(data_robustness_check, zcol = c("HYBAS_ID", "WMOBB_name", "limiting_factor", "num_stations", "num_years", "last_year", "sum_samples"))
+) +
+mapview(
+  data_robustness_check,
+  layer.name = "Last year",
+  label = "WMOBB_name",
+  zcol = "last_year",
+  at = c(2000, 2005, 2010, 2015, 2020, 2021),
+  col.regions = scales::brewer_pal(type = "seq", palette = "Reds", direction = -1)(6),
+  lwd = 0.2,
+  alpha.regions = 0.25,
+  popup = popupTable(data_robustness_check, zcol = c("HYBAS_ID", "WMOBB_name", "limiting_factor", "num_stations", "num_years", "last_year", "sum_samples"))
+) +
+mapview(
+  data_robustness_check,
+  layer.name = "Number of samples",
+  label = "WMOBB_name",
+  zcol = "sum_samples",
+  at = round(quantile(data_robustness_check$sum_samples, probs = seq(0,1,0.2), na.rm = T)),
+  col.regions = scales::brewer_pal(type = "seq", palette = "Reds", direction = -1)(6),
+  lwd = 0.2,
+  alpha.regions = 0.25,
+  popup = popupTable(data_robustness_check, zcol = c("HYBAS_ID", "WMOBB_name", "limiting_factor", "num_stations", "num_years", "last_year", "sum_samples"))
+)
+map_robustness_check
+```
+
+## 6. Export data
+
+```{r}
+mapshot(map_n + map_p, here("outputs", "eu_water_quality_baseline.html"))
+```
+
+```{r}
+mapshot(map_robustness_check, here("outputs", "eu_water_quality_baseline_robustness_check.html"))
+```
+
+```{r}
+write_rds(summary_pts, here("outputs", "summary_pts.rds"))
+write_rds(summary_h6, here("outputs", "summary_h6.rds"))
+```
+
+```{r}
+st_write(summary_pts, here("outputs", "shp", "summary_pts.shp"), layer_options = "ENCODING=UTF-8", delete_layer = TRUE)
+st_write(summary_h6, here("outputs", "shp", "summary_h6.shp"), layer_options = "ENCODING=UTF-8", delete_layer = TRUE)
+```
+
+```{r}
+write.xlsx(list(
+  "HydroBasins 6" = st_drop_geometry(summary_h6),
+  "Monitoring Sites" = st_drop_geometry(summary_pts)
+),
+  file = here("outputs", "eu_water_quality_baseline.xlsx"), rowNames = FALSE)
+```
