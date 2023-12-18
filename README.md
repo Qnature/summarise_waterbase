@@ -6,7 +6,7 @@ Data Sources:
 - [WISE WFD Reference Spatial Datasets reported under Water Framework Directive](https://sdi.eea.europa.eu/data/b15c7595-8e41-45ff-b657-a62f411e3f42)
 - [State of Nature layers for Water Availability and Water Pollution to support SBTN Step 1](https://zenodo.org/records/7797979)
 
-The main output are shapefiles of baseline nutrient concentrations:
+The main output is a shapefile containing baseline nutrient concentrations:
 
 - Total Nitrogen (N) Concentration
 ![hydrobasins6_n_concentration](https://github.com/Qnature/summarise_waterbase/assets/136806514/447a8514-3ab7-4a7a-8d32-1382b97b54bd)
